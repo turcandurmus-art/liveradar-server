@@ -29,7 +29,10 @@ wss.on("connection", (ws) => {
       if (ControlEvent?.DISCONNECTED) conn.on(ControlEvent.DISCONNECTED, () => status("TikTok bağlantısı kesildi"));
       if (ControlEvent?.ERROR) conn.on(ControlEvent.ERROR, (e) => status("TikTok hatası: " + (e?.info ?? e?.message ?? e)));
       conn.on(WebcastEvent.STREAM_END, () => status("Yayın sona erdi"));
-      conn.on(WebcastEvent.CHAT, (d) => send({ type: "chat", ...u(d), text: d.comment }));
+     conn.on(WebcastEvent.CHAT, (d) => {
+  console.log("CHAT RAW DATA:", JSON.stringify(d));
+  send({ type: "chat", ...u(d), text: d.comment });
+});
       conn.on(WebcastEvent.MEMBER, (d) => send({ type: "member", ...u(d) }));
       conn.on(WebcastEvent.LIKE, (d) => send({ type: "like", ...u(d), count: d.likeCount ?? 1 }));
       await conn.connect();
