@@ -1,71 +1,121 @@
-// LiveRadar bağlayıcı sunucu v4: tiktok-live-connector -> WebSocket
+// LiveRadar TikTok Canlı Yayın Bağlayıcı Sunucu
 import { WebSocketServer } from "ws";
 import { TikTokLiveConnection, WebcastEvent, ControlEvent } from "tiktok-live-connector";
 
-process.on("uncaughtException", (e) => console.error("uncaught", e));
-process.on("unhandledRejection", (e) => console.error("unhandled", e));
+process.on("uncaughtException", (e) => console.error("uncaughtException:", e));
+process.on("unhandledRejection", (e) => console.error("unhandledRejection:", e));
 
-const wss = new WebSocketServer({ port: process.env.PORT || 8081 });
+const PORT = process.env.PORT || 8081;
+const wss = new WebSocketServer({ port: PORT });
 
 wss.on("connection", (ws) => {
-  let conn;
-  const send = (o) => { try { ws.readyState === 1 && ws.send(JSON.stringify({ ts: Date.now(), ...o })); } catch {} };
-  const status = (message) => send({ type: "status", message });
-  const u = (d) => {
-    const nickname = d.user?.nickname || d.nickname || "İzleyici";
-    const user = d.user?.uniqueId || d.uniqueId || d.user?.displayId || (d.user?.userId ? String(d.user.userId) : "") || nickname;
-    return { user, nickname };
+  let conn = null;
+
+  const send = (data) => {
+    try {
+      if (ws.readyState === 1) {
+        ws.send(JSON.stringify({ ts: Date.now(), ...data }));
+      }
+    } catch {}
   };
 
-  // Render boşta bağlantıyı kesmesin diye 20 saniyede bir ping
-  const ping = setInterval(() => { try { ws.ping(); } catch {} }, 20000);
+  const status = (message) => send({ type: "status", message });
+
+  const extractUser = (d) => ({
+    user: d.user?.uniqueId || d.user?.displayId || d.uniqueId || String(d.user?.id ?? d.userId ?? "?"),
+    nickname: d.user?.nickname || d.nickname || d.user?.uniqueId || "?"
+  });
+
+  // Render sunucusunun boştayken bağlantıyı kesmesini önlemek için 20 sn'de bir ping
+  const pingInterval = setInterval(() => {
+    try { ws.ping(); } catch {}
+  }, 20000);
 
   ws.on("message", async (raw) => {
     let msg;
-    try { msg = JSON.parse(raw); } catch { return; }
-    if (msg.action !== "start" || !msg.uniqueId) return;
-    const id = String(msg.uniqueId).replace(/^@/, "").replace(/.*tiktok\.com\/@([^/?]+).*/, "$1");
-    try { conn?.disconnect(); } catch {}
-    status(`@${id} yayınına bağlanılıyor…`);
     try {
-      conn = new TikTokLiveConnection(id, process.env.EULER_API_KEY ? { signApiKey: process.env.EULER_API_KEY } : {});
-      conn.on("error", (e) => status("TikTok hatası: " + (e?.info ?? e?.message ?? e)));
-      if (ControlEvent?.DISCONNECTED) conn.on(ControlEvent.DISCONNECTED, () => status("TikTok bağlantısı kesildi"));
-      if (ControlEvent?.ERROR) conn.on(ControlEvent.ERROR, (e) => status("TikTok hatası: " + (e?.info ?? e?.message ?? e)));
-      conn.on(WebcastEvent.STREAM_END, () => status("Yayın sona erdi"));
-      
-      // TikTok v3 protokolünde mesaj d.content olarak gelir
-      conn.on(WebcastEvent.CHAT, (d) => {
-        const text = d.content || d.comment || d.text || d.message || "";
-        send({ type: "chat", ...u(d), text, content: text });
+      msg = JSON.parse(raw);
+    } catch {
+      return;
+    }
+
+    if (msg.action !== "start" || !msg.uniqueId) return;
+
+    // Kullanıcı adını / bağlantı linkini temizleme
+    const uniqueId = String(msg.uniqueId)
+      .trim()
+      .replace(/^@/, "")
+      .replace(/.*tiktok\.com\/@([^/?]+).*/, "$1");
+
+    try { conn?.disconnect(); } catch {}
+
+    status(`@${uniqueId} yayınına bağlanılıyor…`);
+
+    try {
+      conn = new TikTokLiveConnection(uniqueId, {
+        processInitialData: false,
+        enableExtendedGiftInfo: true,
+        ...(process.env.EULER_API_KEY ? { signApiKey: process.env.EULER_API_KEY } : {})
       });
-      conn.on(WebcastEvent.MEMBER, (d) => send({ type: "member", ...u(d) }));
-      conn.on(WebcastEvent.LIKE, (d) => send({ type: "like", ...u(d), count: d.likeCount ?? d.count ?? 1 }));
-      
+
+      conn.on("error", (err) => {
+        status("TikTok hatası: " + (err?.info ?? err?.message ?? err));
+      });
+
+      if (ControlEvent?.DISCONNECTED) {
+        conn.on(ControlEvent.DISCONNECTED, () => status("TikTok bağlantısı kesildi"));
+      }
+      if (ControlEvent?.ERROR) {
+        conn.on(ControlEvent.ERROR, (err) => status("TikTok hatası: " + (err?.info ?? err?.message ?? err)));
+      }
+
+      conn.on(WebcastEvent.STREAM_END, () => status("Yayın sona erdi"));
+
+      // Sohbet mesajları (TikTok'un comment veya content olarak gönderdiği tüm metinleri yakalar)
+      conn.on(WebcastEvent.CHAT, (d) => {
+        const text = d.comment ?? d.content ?? d.text ?? "";
+        send({ type: "chat", ...extractUser(d), text });
+      });
+
+      // Katılan izleyiciler
+      conn.on(WebcastEvent.MEMBER, (d) => {
+        send({ type: "member", ...extractUser(d) });
+      });
+
+      // Beğeniler
+      conn.on(WebcastEvent.LIKE, (d) => {
+        const count = d.likeCount ?? d.count ?? 1;
+        send({ type: "like", ...extractUser(d), count });
+      });
+
+      // Hediyeler ve Jeton / Elmas değerleri
+      conn.on(WebcastEvent.GIFT, (d) => {
+        const giftName = d.giftName ?? d.gift?.name ?? d.describe ?? "Hediye";
+        const giftCount = d.repeatCount ?? d.giftCount ?? d.count ?? 1;
+        const diamonds = d.diamondCount ?? (d.gift?.diamond_count ? d.gift.diamond_count * giftCount : 0);
+        send({
+          type: "gift",
+          ...extractUser(d),
+          giftName,
+          giftCount,
+          diamonds
+        });
+      });
+
       await conn.connect();
-      status(`@${id} yayınına bağlanıldı`);
-    } catch (e) {
-      status("Bağlanılamadı: " + (e?.message ?? e) + " (yayın açık mı? kullanıcı adı doğru mu?)");
+      status(`@${uniqueId} yayınına bağlanıldı`);
+    } catch (err) {
+      status("Bağlanılamadı: " + (err?.message ?? err) + " (yayın açık mı? kullanıcı adı doğru mu?)");
     }
   });
 
-  ws.on("close", () => { clearInterval(ping); try { conn?.disconnect(); } catch {} });
-});
-
-console.log("LiveRadar server v4 ready");
-
-// Hediye akışı (gönderen, hediye adı, adedi ve jeton değeri)
-conn.on(WebcastEvent.GIFT, (d) => {
-  // TikTok hediye tekrar serisi bittiğinde veya tekil hediyelerde
-  if (d.gift?.giftType === 1 && d.repeatEnd !== 1) return; // seri hediyelerde sonuncuyu al
-  send({
-    type: "gift",
-    ...u(d),
-    giftName: d.giftName || d.gift?.name || "Hediye",
-    giftId: d.giftId || d.gift?.id,
-    count: d.repeatCount || d.comboCount || d.gift?.count || 1,
-    diamondCount: d.diamondCount || (d.gift?.diamondCount ? d.gift.diamondCount * (d.repeatCount || 1) : 0)
+  ws.on("close", () => {
+    clearInterval(pingInterval);
+    try { conn?.disconnect(); } catch {}
   });
 });
+
+console.log("LiveRadar sunucusu hazır!");
+          
 
       
