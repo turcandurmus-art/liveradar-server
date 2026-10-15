@@ -10,6 +10,8 @@ process.on("unhandledRejection", (err) => console.error("unhandledRejection:", e
 
 const PORT = process.env.PORT || 8081;
 
+console.log("EULER_API_KEY tanımlı mı:", !!process.env.EULER_API_KEY);
+
 // Durum kontrol sayfası
 const server = http.createServer((req, res) => {
   if (req.url === "/health") {
@@ -33,6 +35,7 @@ const server = http.createServer((req, res) => {
 const wss = new WebSocketServer({ server });
 
 wss.on("connection", (ws) => {
+  console.log("🔌 Yeni WebSocket bağlantısı geldi");
   let conn = null;
 
   const send = (obj) => {
@@ -41,29 +44,40 @@ wss.on("connection", (ws) => {
     } catch {}
   };
 
-  const status = (text) => send({ type: "status", text, ts: Date.now() });
+  const status = (text) => {
+    console.log("📤 status gönderiliyor:", text);
+    send({ type: "status", text, ts: Date.now() });
+  };
 
   ws.on("message", (raw) => {
+    console.log("📩 Mesaj alındı:", String(raw));
     let msg;
     try {
       msg = JSON.parse(String(raw));
-    } catch {
+    } catch (e) {
+      console.log("❌ JSON parse hatası:", e.message);
       return;
     }
 
     if (msg.action === "stop") {
+      console.log("🛑 stop komutu alındı");
       try { conn?.disconnect(); } catch {}
       conn = null;
       status("Oturum durduruldu.");
       return;
     }
 
-    if (msg.action !== "start" || !msg.uniqueId) return;
+    if (msg.action !== "start" || !msg.uniqueId) {
+      console.log("⚠️ Geçersiz action veya uniqueId yok:", msg);
+      return;
+    }
 
     const uniqueId = String(msg.uniqueId)
       .trim()
       .replace(/^@/, "")
       .replace(/.*tiktok\.com\/@([^/?]+).*/, "$1");
+
+    console.log("▶️ start komutu alındı, uniqueId:", uniqueId);
 
     try { conn?.disconnect(); } catch {}
     conn = null;
@@ -71,7 +85,6 @@ wss.on("connection", (ws) => {
     status(`@${uniqueId} yayınına bağlanılıyor…`);
 
     try {
-      // Ağır veri indirmeleri tamamen kapalı — sıfır imza ücreti, hafif ve anlık bağlantı
       conn = new TikTokLiveConnection(uniqueId, {
         processInitialData: false,
         fetchRoomInfoOnConnect: false,
@@ -81,6 +94,7 @@ wss.on("connection", (ws) => {
 
       conn.on("error", (err) => {
         const msg = String(err?.info ?? err?.message ?? err);
+        console.log("🔴 conn error event:", msg);
         if (msg.includes("rate_limit") || msg.includes("Rate Limit")) {
           status("Geçici hız sınırı. Lütfen 30 saniye bekleyip tekrar deneyin.");
         } else if (msg.includes("isn't online")) {
@@ -93,12 +107,17 @@ wss.on("connection", (ws) => {
       });
 
       if (ControlEvent?.DISCONNECTED) {
-        conn.on(ControlEvent.DISCONNECTED, () => status("Yayın bağlantısı kesildi."));
+        conn.on(ControlEvent.DISCONNECTED, () => {
+          console.log("🔌 DISCONNECTED event");
+          status("Yayın bağlantısı kesildi.");
+        });
       }
 
-      conn.on(WebcastEvent.STREAM_END, () => status("Canlı yayın sona erdi."));
+      conn.on(WebcastEvent.STREAM_END, () => {
+        console.log("🔚 STREAM_END event");
+        status("Canlı yayın sona erdi.");
+      });
 
-      // Sohbet mesajları
       conn.on(WebcastEvent.CHAT, (d) => {
         const user = d.user?.displayId || d.uniqueId || d.user?.nickname || "izleyici";
         const nickname = d.user?.nickname || d.user?.displayId || d.nickname || "izleyici";
@@ -112,7 +131,6 @@ wss.on("connection", (ws) => {
         });
       });
 
-      // Beğeniler
       conn.on(WebcastEvent.LIKE, (d) => {
         const user = d.user?.displayId || d.uniqueId || d.user?.nickname || "izleyici";
         const nickname = d.user?.nickname || d.user?.displayId || d.nickname || "izleyici";
@@ -125,7 +143,6 @@ wss.on("connection", (ws) => {
         });
       });
 
-      // Yayına katılanlar
       conn.on(WebcastEvent.MEMBER, (d) => {
         const user = d.user?.displayId || d.uniqueId || d.user?.nickname || "izleyici";
         const nickname = d.user?.nickname || d.user?.displayId || d.nickname || "izleyici";
@@ -137,7 +154,6 @@ wss.on("connection", (ws) => {
         });
       });
 
-      // Canlı hediye akışı (ön indirme yapmaz, atıldığında anlık iletir)
       conn.on(WebcastEvent.GIFT, (d) => {
         const user = d.user?.displayId || d.uniqueId || d.user?.nickname || "izleyici";
         const nickname = d.user?.nickname || d.user?.displayId || d.nickname || "izleyici";
@@ -153,12 +169,16 @@ wss.on("connection", (ws) => {
         });
       });
 
+      console.log("🔗 conn.connect() çağrılıyor...");
       conn.connect()
-        .then(() => {
+        .then((state) => {
+          console.log("✅ Bağlantı başarılı! State:", JSON.stringify(state)?.slice(0, 300));
           status("Canlı yayına başarıyla bağlandı!");
         })
         .catch((err) => {
           const m = String(err?.info ?? err?.message ?? err);
+          console.log("❌ conn.connect() hata verdi:", m);
+          console.log("Tam hata objesi:", err);
           if (m.includes("isn't online")) {
             status(`@${uniqueId} şu an canlı yayında değil.`);
           } else if (m.includes("rate_limit") || m.includes("Rate Limit")) {
@@ -171,16 +191,19 @@ wss.on("connection", (ws) => {
         });
 
     } catch (e) {
+      console.log("❌ try-catch hata:", e?.message || e);
       status("Hata: " + (e?.message || e));
     }
   });
 
   ws.on("close", () => {
+    console.log("🔌 WebSocket bağlantısı kapandı");
     try { conn?.disconnect(); } catch {}
     conn = null;
   });
 
-  ws.on("error", () => {
+  ws.on("error", (err) => {
+    console.log("🔴 WebSocket error:", err?.message || err);
     try { conn?.disconnect(); } catch {}
     conn = null;
   });
