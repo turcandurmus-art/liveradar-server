@@ -2,13 +2,16 @@
   "name": "liveradar-server",
   "version": "1.0.0",
   "type": "module",
-  "main": "server.js",
   "scripts": {
     "start": "node server.js"
+  },
+  "engines": {
+    "node": ">=20.0.0"
   },
   "dependencies": {
     "tiktok-live-connector": "^2.5.0",
     "ws": "^8.18.0"
   }
 }
+
 
