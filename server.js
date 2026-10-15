@@ -53,4 +53,19 @@ wss.on("connection", (ws) => {
 });
 
 console.log("LiveRadar server v4 ready");
+
+// Hediye akışı (gönderen, hediye adı, adedi ve jeton değeri)
+conn.on(WebcastEvent.GIFT, (d) => {
+  // TikTok hediye tekrar serisi bittiğinde veya tekil hediyelerde
+  if (d.gift?.giftType === 1 && d.repeatEnd !== 1) return; // seri hediyelerde sonuncuyu al
+  send({
+    type: "gift",
+    ...u(d),
+    giftName: d.giftName || d.gift?.name || "Hediye",
+    giftId: d.giftId || d.gift?.id,
+    count: d.repeatCount || d.comboCount || d.gift?.count || 1,
+    diamondCount: d.diamondCount || (d.gift?.diamondCount ? d.gift.diamondCount * (d.repeatCount || 1) : 0)
+  });
+});
+
       
