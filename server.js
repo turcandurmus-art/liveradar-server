@@ -1,15 +1,12 @@
-// KoRSaN PaNeL – bağlayıcı sunucu (Hafif Sürüm + Mesaj Hafızası)
-// Her yayın için TEK TikTok bağlantısı açılır, son 500 olay RAM'de tutulur.
-// Panel arka plandan dönüp yeniden bağlandığında "since" ile kaçan olaylar anında geri gönderilir.
+// KoRSaN PaNeL – Bağlayıcı Sunucu
 import http from "http";
 import { WebSocketServer } from "ws";
 import { TikTokLiveConnection, WebcastEvent, ControlEvent } from "tiktok-live-connector";
 
 const PORT = process.env.PORT || 10000;
-const BUFFER_SIZE = 500; // yayın başına saklanan son olay sayısı
-const IDLE_CLOSE_MS = 10 * 60 * 1000; // hiç panel kalmazsa 10 dk sonra TikTok bağlantısını kapat
+const BUFFER_SIZE = 500;
+const IDLE_CLOSE_MS = 10 * 60 * 1000;
 
-/** uniqueId -> { conn, buffer, seq, clients:Set, idleTimer, connected } */
 const rooms = new Map();
 
 function pushEvent(room, ev) {
@@ -28,7 +25,9 @@ function status(room, text) {
 
 function userOf(d) {
   const u = d.user || d;
-  return { user: u.uniqueId || u.userId || "?", nickname: u.nickname || u.uniqueId || "?" };
+  const user = u.displayId || u.uniqueId || (u.id ? String(u.id) : "") || u.nickname || "izleyici";
+  const nickname = u.nickname || u.displayId || u.uniqueId || user;
+  return { user, nickname };
 }
 
 function openRoom(uniqueId) {
@@ -48,9 +47,29 @@ function connectTikTok(uniqueId, room) {
   });
   room.conn = conn;
 
-  conn.on(WebcastEvent.CHAT, (d) => pushEvent(room, { type: "chat", ...userOf(d), text: d.comment || "" }));
-  conn.on(WebcastEvent.LIKE, (d) => pushEvent(room, { type: "like", ...userOf(d), count: d.likeCount || 1 }));
+  // Sohbet (content, comment veya text alanlarını eksiksiz okur)
+  conn.on(WebcastEvent.CHAT, (d) => {
+    const text = d.content ?? d.comment ?? d.text ?? "";
+    pushEvent(room, { type: "chat", ...userOf(d), text: String(text) });
+  });
+
+  // Beğeni (count veya likeCount)
+  conn.on(WebcastEvent.LIKE, (d) => {
+    const count = Number(d.count ?? d.likeCount ?? 1) || 1;
+    pushEvent(room, { type: "like", ...userOf(d), count });
+  });
+
+  // Giriş
   conn.on(WebcastEvent.MEMBER, (d) => pushEvent(room, { type: "member", ...userOf(d) }));
+
+  // Hediyeler
+  conn.on(WebcastEvent.GIFT, (d) => {
+    const giftName = d.giftName || d.gift?.name || d.describe || "Hediye";
+    const giftCount = Number(d.repeatCount ?? d.giftCount ?? d.count ?? 1) || 1;
+    const diamonds = (Number(d.diamondCount) || 0) * giftCount;
+    pushEvent(room, { type: "gift", ...userOf(d), giftName, giftCount, diamonds });
+  });
+
   conn.on(WebcastEvent.STREAM_END, () => status(room, "Yayın sona erdi"));
   conn.on(ControlEvent.DISCONNECTED, () => {
     room.connected = false;
@@ -105,7 +124,6 @@ wss.on("connection", (ws) => {
       clearTimeout(room.idleTimer);
       room.clients.add(ws);
 
-      // Kaçan olayları gönder (since = panelin aldığı son id)
       const since = Number(msg.since) || 0;
       const missed = since > 0 ? room.buffer.filter((e) => e.id > since) : room.buffer.slice(-200);
       if (missed.length) ws.send(JSON.stringify({ type: "history", events: missed }));
@@ -133,5 +151,3 @@ wss.on("connection", (ws) => {
 
 server.listen(PORT, () => console.log("KoRSaN PaNeL sunucusu port " + PORT));
 
-
-        
