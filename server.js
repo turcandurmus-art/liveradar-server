@@ -1,17 +1,25 @@
-// KoRSaN PaNeL – Bağlayıcı Sunucu
+// KoRSaN PaNeL – Bağlayıcı Sunucu (v2.5 Uyumlu + Otomatik Askıdan Kurtarma)
 import http from "http";
 import { WebSocketServer } from "ws";
 import { TikTokLiveConnection, WebcastEvent, ControlEvent } from "tiktok-live-connector";
 
 const PORT = process.env.PORT || 10000;
 const BUFFER_SIZE = 500;
-const IDLE_CLOSE_MS = 10 * 60 * 1000;
+const IDLE_CLOSE_MS = 2 * 60 * 1000;
 
 const rooms = new Map();
+
+function userOf(d) {
+  const u = d.user || d;
+  const user = u.displayId || u.uniqueId || u.id || u.userId || "?";
+  const nickname = u.nickname || user;
+  return { user, nickname };
+}
 
 function pushEvent(room, ev) {
   ev.id = ++room.seq;
   ev.ts = ev.ts || Date.now();
+  room.lastEventAt = ev.ts;
   room.buffer.push(ev);
   if (room.buffer.length > BUFFER_SIZE) room.buffer.shift();
   const msg = JSON.stringify(ev);
@@ -23,17 +31,24 @@ function status(room, text) {
   for (const ws of room.clients) if (ws.readyState === 1) ws.send(msg);
 }
 
-function userOf(d) {
-  const u = d.user || d;
-  const user = u.displayId || u.uniqueId || (u.id ? String(u.id) : "") || u.nickname || "izleyici";
-  const nickname = u.nickname || u.displayId || u.uniqueId || user;
-  return { user, nickname };
+function closeRoom(uniqueId) {
+  const room = rooms.get(uniqueId);
+  if (!room) return;
+  rooms.delete(uniqueId);
+  clearTimeout(room.idleTimer);
+  try { room.conn?.disconnect(); } catch {}
 }
 
 function openRoom(uniqueId) {
   let room = rooms.get(uniqueId);
-  if (room) return room;
-  room = { conn: null, buffer: [], seq: 0, clients: new Set(), idleTimer: null, connected: false, retry: 0 };
+  if (room) {
+    // 2 dakikadır hiç olay gelmediyse eski askıdaki bağlantıyı kapatıp yeniden aç
+    const stale = Date.now() - (room.lastEventAt || 0) > 2 * 60 * 1000;
+    if (!stale && room.connected) return room;
+    closeRoom(uniqueId);
+  }
+
+  room = { conn: null, buffer: [], seq: 0, clients: new Set(), idleTimer: null, connected: false, retry: 0, lastEventAt: Date.now() };
   rooms.set(uniqueId, room);
   connectTikTok(uniqueId, room);
   return room;
@@ -47,30 +62,30 @@ function connectTikTok(uniqueId, room) {
   });
   room.conn = conn;
 
-  // Sohbet (content, comment veya text alanlarını eksiksiz okur)
   conn.on(WebcastEvent.CHAT, (d) => {
-    const text = d.content ?? d.comment ?? d.text ?? "";
-    pushEvent(room, { type: "chat", ...userOf(d), text: String(text) });
+    const text = d.content || d.comment || d.text || "";
+    pushEvent(room, { type: "chat", ...userOf(d), text });
   });
 
-  // Beğeni (count veya likeCount)
   conn.on(WebcastEvent.LIKE, (d) => {
-    const count = Number(d.count ?? d.likeCount ?? 1) || 1;
+    const count = d.count || d.likeCount || 1;
     pushEvent(room, { type: "like", ...userOf(d), count });
   });
 
-  // Giriş
   conn.on(WebcastEvent.MEMBER, (d) => pushEvent(room, { type: "member", ...userOf(d) }));
 
-  // Hediyeler
   conn.on(WebcastEvent.GIFT, (d) => {
-    const giftName = d.giftName || d.gift?.name || d.describe || "Hediye";
-    const giftCount = Number(d.repeatCount ?? d.giftCount ?? d.count ?? 1) || 1;
-    const diamonds = (Number(d.diamondCount) || 0) * giftCount;
+    const giftName = d.giftDetails?.giftName || d.giftName || d.gift?.name || "Hediye";
+    const giftCount = d.repeatCount || d.giftCount || d.count || 1;
+    const diamonds = (d.diamondCount || d.diamonds || 0) * giftCount;
     pushEvent(room, { type: "gift", ...userOf(d), giftName, giftCount, diamonds });
   });
 
-  conn.on(WebcastEvent.STREAM_END, () => status(room, "Yayın sona erdi"));
+  conn.on(WebcastEvent.STREAM_END, () => {
+    status(room, "Yayın sona erdi");
+    closeRoom(uniqueId);
+  });
+
   conn.on(ControlEvent.DISCONNECTED, () => {
     room.connected = false;
     if (!rooms.has(uniqueId)) return;
@@ -79,25 +94,17 @@ function connectTikTok(uniqueId, room) {
     setTimeout(() => rooms.get(uniqueId) === room && connectTikTok(uniqueId, room), wait);
   });
 
-  conn
-    .connect()
-    .then(() => {
+  conn.connect()
+    .then((state) => {
       room.connected = true;
       room.retry = 0;
-      status(room, `@${uniqueId} yayınına bağlanıldı`);
+      room.lastEventAt = Date.now();
+      status(room, `@${uniqueId} yayınına bağlandı`);
     })
     .catch((err) => {
       status(room, "Bağlanılamadı: " + (err?.message || err));
       closeRoom(uniqueId);
     });
-}
-
-function closeRoom(uniqueId) {
-  const room = rooms.get(uniqueId);
-  if (!room) return;
-  rooms.delete(uniqueId);
-  clearTimeout(room.idleTimer);
-  try { room.conn?.disconnect(); } catch {}
 }
 
 const server = http.createServer((req, res) => {
@@ -129,9 +136,7 @@ wss.on("connection", (ws) => {
       if (missed.length) ws.send(JSON.stringify({ type: "history", events: missed }));
       ws.send(JSON.stringify({
         type: "status",
-        message: room.connected
-          ? `@${id} yayınına bağlı${since && missed.length ? ` — ${missed.length} kaçan olay geri alındı` : ""}`
-          : `@${id} yayınına bağlanılıyor…`,
+        message: room.connected ? `@${id} yayınına bağlı` : `@${id} yayınına bağlanılıyor…`,
         ts: Date.now(),
       }));
     }
@@ -150,4 +155,3 @@ wss.on("connection", (ws) => {
 });
 
 server.listen(PORT, () => console.log("KoRSaN PaNeL sunucusu port " + PORT));
-
